@@ -10,10 +10,12 @@ import torch
 import torch.nn as nn
 import torch.utils
 import torch.nn.functional as F
+from torchvision import transforms
+from PIL import Image
 from tensorboardX import SummaryWriter
 
 import numpy as np
-from thop import profile
+from thop import profile, clever_format
 
 from config_train import config
 if config.is_eval:
@@ -33,6 +35,59 @@ from model_seg import Network_Multi_Path_Infer as Network
 import seg_metrics
 
 
+cityscapes_colormap = {
+    0: (128, 64, 128),    # road
+    1: (244, 35, 232),    # sidewalk
+    2: (70, 70, 70),      # building
+    3: (102, 102, 156),   # wall
+    4: (190, 153, 153),   # fence
+    5: (153, 153, 153),   # pole
+    6: (250, 170, 30),    # traffic light
+    7: (220, 220, 0),     # traffic sign
+    8: (107, 142, 35),    # vegetation
+    9: (152, 251, 152),   # terrain
+    10: (70, 130, 180),   # sky
+    11: (220, 20, 60),    # person
+    12: (255, 0, 0),      # rider
+    13: (0, 0, 142),      # car
+    14: (0, 0, 70),       # truck
+    15: (0, 60, 100),     # bus
+    16: (0, 80, 100),     # train
+    17: (0, 0, 230),      # motorcycle
+    18: (119, 11, 32),    # bicycle
+    19: (0, 0, 0),        # unlabeled (often ignored)
+}
+
+def load_image_as_tensor(image_path):
+    try:
+        image = Image.open(image_path).convert('RGB')
+
+    except FileNotFoundError:
+        print(f"Error: the image file '{image_path}' was not found")
+        exit()
+
+    to_tensor = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
+        transforms.CenterCrop(size=(512, 1024))
+    ])
+
+    image_tensor = to_tensor(image)
+    image_tensor = image_tensor.unsqueeze(0)
+
+    return image_tensor
+
+
+def output_to_image(output, colormap):
+    if torch.is_tensor(output):
+        output = output.squeeze().cpu().numpy()
+
+    image = np.zeros((output.shape[0], output.shape[1], 3), dtype=np.uint8)
+
+    for label_id, color in colormap.items():
+        image[output == label_id] = color
+
+    return Image.fromarray(image)
 
 def adjust_learning_rate(base_lr, power, optimizer, epoch, total_epoch):
     for param_group in optimizer.param_groups:
@@ -40,28 +95,30 @@ def adjust_learning_rate(base_lr, power, optimizer, epoch, total_epoch):
 
 
 def main():
-    create_exp_dir(config.save, scripts_to_save=glob.glob('*.py')+glob.glob('*.sh'))
-    logger = SummaryWriter(config.save)
+    device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 
-    log_format = '%(asctime)s %(message)s'
-    logging.basicConfig(stream=sys.stdout, level=logging.INFO, format=log_format, datefmt='%m/%d %I:%M:%S %p')
-    fh = logging.FileHandler(os.path.join(config.save, 'log.txt'))
-    fh.setFormatter(logging.Formatter(log_format))
-    logging.getLogger().addHandler(fh)
-    logging.info("args = %s", str(config))
-    # preparation ################
-    torch.backends.cudnn.enabled = True
-    torch.backends.cudnn.benchmark = True
-    seed = config.seed
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed(seed)
+    # create_exp_dir(config.save, scripts_to_save=glob.glob('*.py')+glob.glob('*.sh'))
+    # logger = SummaryWriter(config.save)
 
-    # config network and criterion ################
-    min_kept = int(config.batch_size * config.image_height * config.image_width // (16 * config.gt_down_sampling ** 2))
-    ohem_criterion = ProbOhemCrossEntropy2d(ignore_label=255, thresh=0.7, min_kept=min_kept, use_weight=False)
-    distill_criterion = nn.KLDivLoss()
+    # log_format = '%(asctime)s %(message)s'
+    # logging.basicConfig(stream=sys.stdout, level=logging.INFO, format=log_format, datefmt='%m/%d %I:%M:%S %p')
+    # fh = logging.FileHandler(os.path.join(config.save, 'log.txt'))
+    # fh.setFormatter(logging.Formatter(log_format))
+    # logging.getLogger().addHandler(fh)
+    # logging.info("args = %s", str(config))
+    # # preparation ################
+    # torch.backends.cudnn.enabled = True
+    # torch.backends.cudnn.benchmark = True
+    # seed = config.seed
+    # np.random.seed(seed)
+    # torch.manual_seed(seed)
+    # if torch.cuda.is_available():
+    #     torch.cuda.manual_seed(seed)
+
+    # # config network and criterion ################
+    # min_kept = int(config.batch_size * config.image_height * config.image_width // (16 * config.gt_down_sampling ** 2))
+    # ohem_criterion = ProbOhemCrossEntropy2d(ignore_label=255, thresh=0.7, min_kept=min_kept, use_weight=False)
+    # distill_criterion = nn.KLDivLoss()
 
     # data loader ###########################
     if config.is_test:
@@ -79,8 +136,7 @@ def main():
                         'test_source': config.test_source,
                         'down_sampling': config.down_sampling}
 
-    train_loader = get_train_loader(config, Cityscapes, test=config.is_test)
-
+    # train_loader = get_train_loader(config, Cityscapes, test=config.is_test)
 
     # Model #######################################
     models = []
@@ -101,119 +157,165 @@ def main():
 
         mIoU02 = state["mIoU02"]; latency02 = state["latency02"]; obj02 = objective_acc_lat(mIoU02, latency02)
         mIoU12 = state["mIoU12"]; latency12 = state["latency12"]; obj12 = objective_acc_lat(mIoU12, latency12)
-        if obj02 > obj12: last = [2, 0]
-        else: last = [2, 1]
+        if obj02 > obj12:
+            last = [2, 0]
+        else:
+            last = [2, 1]
         lasts.append(last)
         model.build_structure(last)
-        logging.info("net: " + str(model))
-        for b in last:
-            if len(config.width_mult_list) > 1:
-                plot_op(getattr(model, "ops%d"%b), getattr(model, "path%d"%b), width=getattr(model, "widths%d"%b), head_width=config.stem_head_width[idx][1], F_base=config.Fch).savefig(os.path.join(config.save, "ops_%d_%d.png"%(arch_idx,b)), bbox_inches="tight")
-            else:
-                plot_op(getattr(model, "ops%d"%b), getattr(model, "path%d"%b), F_base=config.Fch).savefig(os.path.join(config.save, "ops_%d_%d.png"%(arch_idx,b)), bbox_inches="tight")
-        plot_path_width(model.lasts, model.paths, model.widths).savefig(os.path.join(config.save, "path_width%d.png"%arch_idx))
-        plot_path_width([2, 1, 0], [model.path2, model.path1, model.path0], [model.widths2, model.widths1, model.widths0]).savefig(os.path.join(config.save, "path_width_all%d.png"%arch_idx))
-        flops, params = profile(model, inputs=(torch.randn(1, 3, 1024, 2048),), verbose=False)
-        logging.info("params = %fMB, FLOPs = %fGB", params / 1e6, flops / 1e9)
-        logging.info("ops:" + str(model.ops))
-        logging.info("path:" + str(model.paths))
-        logging.info("last:" + str(model.lasts))
-        model = model.cuda()
-        init_weight(model, nn.init.kaiming_normal_, torch.nn.BatchNorm2d, config.bn_eps, config.bn_momentum, mode='fan_in', nonlinearity='relu')
+        # logging.info("net: " + str(model))
+        # for b in last:
+        #     if len(config.width_mult_list) > 1:
+        #         plot_op(getattr(model, "ops%d"%b), getattr(model, "path%d"%b), width=getattr(model, "widths%d"%b), head_width=config.stem_head_width[idx][1], F_base=config.Fch).savefig(os.path.join(config.save, "ops_%d_%d.png"%(arch_idx,b)), bbox_inches="tight")
+        #     else:
+        #         plot_op(getattr(model, "ops%d"%b), getattr(model, "path%d"%b), F_base=config.Fch).savefig(os.path.join(config.save, "ops_%d_%d.png"%(arch_idx,b)), bbox_inches="tight")
+        # plot_path_width(model.lasts, model.paths, model.widths).savefig(os.path.join(config.save, "path_width%d.png"%arch_idx))
+        # plot_path_width([2, 1, 0], [model.path2, model.path1, model.path0], [model.widths2, model.widths1, model.widths0]).savefig(os.path.join(config.save, "path_width_all%d.png"%arch_idx))
+        # flops, params = profile(model, inputs=(torch.randn(1, 3, 1024, 2048),), verbose=False)
+        # flops, params = clever_format([flops, params], '%.3f')
+        # print(f'FLOPs: {flops}')
+        # print(f'Parameters: {params}')
+        # model.eval()
+
+        # dummy_input = torch.randn(1, 3, 1024, 2048)
+        # model = model.to(device)
+        # dummy_input = dummy_input.to(device)
+        # output = model(dummy_input)
+        # print('Output size:', output.size())
+
+        # logging.info("params = %fMB, FLOPs = %fGB", params / 1e6, flops / 1e9)
+        # logging.info("ops:" + str(model.ops))
+        # logging.info("path:" + str(model.paths))
+        # logging.info("last:" + str(model.lasts))
+        # model = model.cuda()
+        # init_weight(model, nn.init.kaiming_normal_, torch.nn.BatchNorm2d, config.bn_eps, config.bn_momentum, mode='fan_in', nonlinearity='relu')
 
         if arch_idx == 0 and len(config.arch_idx) > 1:
-            partial = torch.load(os.path.join(config.teacher_path, "weights%d.pt"%arch_idx))
+            partial = torch.load(os.path.join(config.teacher_path, "arch_%d.pt"%arch_idx))
             state = model.state_dict()
             pretrained_dict = {k: v for k, v in partial.items() if k in state}
             state.update(pretrained_dict)
             model.load_state_dict(state)
         elif config.is_eval:
-            partial = torch.load(os.path.join(config.eval_path, "weights%d.pt"%arch_idx))
+            partial = torch.load(os.path.join(config.eval_path, "arch_%d.pt"%arch_idx))
+            print(partial)
             state = model.state_dict()
             pretrained_dict = {k: v for k, v in partial.items() if k in state}
+            print(pretrained_dict)
             state.update(pretrained_dict)
             model.load_state_dict(state)
 
-        evaluator = SegEvaluator(Cityscapes(data_setting, 'val', None), config.num_classes, config.image_mean,
-                                 config.image_std, model, config.eval_scale_array, config.eval_flip, 0, out_idx=0, config=config,
-                                 verbose=False, save_path=None, show_image=False, show_prediction=False)
-        evaluators.append(evaluator)
-        tester = SegTester(Cityscapes(data_setting, 'test', None), config.num_classes, config.image_mean,
-                                 config.image_std, model, config.eval_scale_array, config.eval_flip, 0, out_idx=0, config=config,
-                                 verbose=False, save_path=None, show_prediction=False)
-        testers.append(tester)
+        # dummy_input = torch.randn(1, 3, 512, 1024)
+        # model = model.to(device)
+        # dummy_input = dummy_input.to(device)
 
-        # Optimizer ###################################
-        base_lr = config.lr
-        if arch_idx == 1 or len(config.arch_idx) == 1:
-            # optimize teacher solo OR student (w. distill from teacher)
-            optimizer = torch.optim.SGD(model.parameters(), lr=base_lr, momentum=config.momentum, weight_decay=config.weight_decay)
-        models.append(model)
+        model.eval()
 
+        model = model.to(device)
 
-    # Cityscapes ###########################################
-    if config.is_eval:
-        logging.info(config.load_path)
-        logging.info(config.eval_path)
-        logging.info(config.save)
+        image_tensor = load_image_as_tensor('./berlin_000000_000019_leftImg8bit.png')
+        print('Image tensor shape:', image_tensor.shape)
+
+        image_tensor = image_tensor.to(device)
         with torch.no_grad():
-            if config.is_test:
-                # test
-                print("[test...]")
-                with torch.no_grad():
-                    test(0, models, testers, logger)
-            else:
-                # validation
-                print("[validation...]")
-                valid_mIoUs = infer(models, evaluators, logger)
-                for idx, arch_idx in enumerate(config.arch_idx):
-                    if arch_idx == 0:
-                        logger.add_scalar("mIoU/val_teacher", valid_mIoUs[idx], 0)
-                        logging.info("teacher's valid_mIoU %.3f"%(valid_mIoUs[idx]))
-                    else:
-                        logger.add_scalar("mIoU/val_student", valid_mIoUs[idx], 0)
-                        logging.info("student's valid_mIoU %.3f"%(valid_mIoUs[idx]))
-        exit(0)
+            probs = model(image_tensor)
 
-    tbar = tqdm(range(config.nepochs), ncols=80)
-    for epoch in tbar:
-        logging.info(config.load_path)
-        logging.info(config.save)
-        logging.info("lr: " + str(optimizer.param_groups[0]['lr']))
-        # training
-        tbar.set_description("[Epoch %d/%d][train...]" % (epoch + 1, config.nepochs))
-        train_mIoUs = train(train_loader, models, ohem_criterion, distill_criterion, optimizer, logger, epoch)
-        torch.cuda.empty_cache()
-        for idx, arch_idx in enumerate(config.arch_idx):
-            if arch_idx == 0:
-                logger.add_scalar("mIoU/train_teacher", train_mIoUs[idx], epoch)
-                logging.info("teacher's train_mIoU %.3f"%(train_mIoUs[idx]))
-            else:
-                logger.add_scalar("mIoU/train_student", train_mIoUs[idx], epoch)
-                logging.info("student's train_mIoU %.3f"%(train_mIoUs[idx]))
-        adjust_learning_rate(base_lr, 0.992, optimizer, epoch+1, config.nepochs)
+        print('Output size:', probs.size())
+        probs = torch.softmax(probs, dim=1)
+        # print(probs)
 
-        # validation
-        if not config.is_test and ((epoch+1) % 10 == 0 or epoch == 0):
-            tbar.set_description("[Epoch %d/%d][validation...]" % (epoch + 1, config.nepochs))
-            with torch.no_grad():
-                valid_mIoUs = infer(models, evaluators, logger)
-                for idx, arch_idx in enumerate(config.arch_idx):
-                    if arch_idx == 0:
-                        logger.add_scalar("mIoU/val_teacher", valid_mIoUs[idx], epoch)
-                        logging.info("teacher's valid_mIoU %.3f"%(valid_mIoUs[idx]))
-                    else:
-                        logger.add_scalar("mIoU/val_student", valid_mIoUs[idx], epoch)
-                        logging.info("student's valid_mIoU %.3f"%(valid_mIoUs[idx]))
-                    save(models[idx], os.path.join(config.save, "weights%d.pt"%arch_idx))
-        # test
-        if config.is_test and (epoch+1) >= 250 and (epoch+1) % 10 == 0:
-            tbar.set_description("[Epoch %d/%d][test...]" % (epoch + 1, config.nepochs))
-            with torch.no_grad():
-                test(epoch, models, testers, logger)
+        preds = torch.argmax(probs, dim=1)
+        # print(preds)
 
-        for idx, arch_idx in enumerate(config.arch_idx):
-            save(models[idx], os.path.join(config.save, "weights%d.pt"%arch_idx))
+        if torch.is_tensor(preds):
+            preds = preds.squeeze().cpu().numpy()
+
+        print(np.unique(preds))
+
+        # label = output_to_image(preds, cityscapes_colormap)
+        # label.save('result.png')
+        # print(model)
+
+        # evaluator = SegEvaluator(Cityscapes(data_setting, 'val', None), config.num_classes, config.image_mean,
+        #                          config.image_std, model, config.eval_scale_array, config.eval_flip, 0, out_idx=0, config=config,
+        #                          verbose=False, save_path=None, show_image=False, show_prediction=False)
+        # evaluators.append(evaluator)
+        # tester = SegTester(Cityscapes(data_setting, 'test', None), config.num_classes, config.image_mean,
+        #                          config.image_std, model, config.eval_scale_array, config.eval_flip, 0, out_idx=0, config=config,
+        #                          verbose=False, save_path=None, show_prediction=False)
+        # testers.append(tester)
+
+        # # Optimizer ###################################
+        # base_lr = config.lr
+        # if arch_idx == 1 or len(config.arch_idx) == 1:
+        #     # optimize teacher solo OR student (w. distill from teacher)
+        #     optimizer = torch.optim.SGD(model.parameters(), lr=base_lr, momentum=config.momentum, weight_decay=config.weight_decay)
+        # models.append(model)
+
+
+    # # Cityscapes ###########################################
+    # if config.is_eval:
+        # logging.info(config.load_path)
+        # logging.info(config.eval_path)
+        # logging.info(config.save)
+        # with torch.no_grad():
+        #     if config.is_test:
+        #         # test
+        #         print("[test...]")
+        #         with torch.no_grad():
+        #             test(0, models, testers, logger)
+        #     else:
+        #         # validation
+        #         print("[validation...]")
+        #         valid_mIoUs = infer(models, evaluators, logger)
+        #         for idx, arch_idx in enumerate(config.arch_idx):
+        #             if arch_idx == 0:
+        #                 logger.add_scalar("mIoU/val_teacher", valid_mIoUs[idx], 0)
+        #                 logging.info("teacher's valid_mIoU %.3f"%(valid_mIoUs[idx]))
+        #             else:
+        #                 logger.add_scalar("mIoU/val_student", valid_mIoUs[idx], 0)
+        #                 logging.info("student's valid_mIoU %.3f"%(valid_mIoUs[idx]))
+        # exit(0)
+
+    # tbar = tqdm(range(config.nepochs), ncols=80)
+    # for epoch in tbar:
+        # logging.info(config.load_path)
+        # logging.info(config.save)
+        # logging.info("lr: " + str(optimizer.param_groups[0]['lr']))
+        # # training
+        # tbar.set_description("[Epoch %d/%d][train...]" % (epoch + 1, config.nepochs))
+        # train_mIoUs = train(train_loader, models, ohem_criterion, distill_criterion, optimizer, logger, epoch)
+        # torch.cuda.empty_cache()
+        # for idx, arch_idx in enumerate(config.arch_idx):
+        #     if arch_idx == 0:
+        #         logger.add_scalar("mIoU/train_teacher", train_mIoUs[idx], epoch)
+        #         logging.info("teacher's train_mIoU %.3f"%(train_mIoUs[idx]))
+        #     else:
+        #         logger.add_scalar("mIoU/train_student", train_mIoUs[idx], epoch)
+        #         logging.info("student's train_mIoU %.3f"%(train_mIoUs[idx]))
+        # adjust_learning_rate(base_lr, 0.992, optimizer, epoch+1, config.nepochs)
+
+        # # validation
+        # if not config.is_test and ((epoch+1) % 10 == 0 or epoch == 0):
+        #     tbar.set_description("[Epoch %d/%d][validation...]" % (epoch + 1, config.nepochs))
+        #     with torch.no_grad():
+        #         valid_mIoUs = infer(models, evaluators, logger)
+        #         for idx, arch_idx in enumerate(config.arch_idx):
+        #             if arch_idx == 0:
+        #                 logger.add_scalar("mIoU/val_teacher", valid_mIoUs[idx], epoch)
+        #                 logging.info("teacher's valid_mIoU %.3f"%(valid_mIoUs[idx]))
+        #             else:
+        #                 logger.add_scalar("mIoU/val_student", valid_mIoUs[idx], epoch)
+        #                 logging.info("student's valid_mIoU %.3f"%(valid_mIoUs[idx]))
+        #             save(models[idx], os.path.join(config.save, "weights%d.pt"%arch_idx))
+        # # test
+        # if config.is_test and (epoch+1) >= 250 and (epoch+1) % 10 == 0:
+        #     tbar.set_description("[Epoch %d/%d][test...]" % (epoch + 1, config.nepochs))
+        #     with torch.no_grad():
+        #         test(epoch, models, testers, logger)
+
+        # for idx, arch_idx in enumerate(config.arch_idx):
+        #     save(models[idx], os.path.join(config.save, "weights%d.pt"%arch_idx))
 
 
 def train(train_loader, models, criterion, distill_criterion, optimizer, logger, epoch):

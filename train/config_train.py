@@ -18,8 +18,10 @@ C.seed = 12345
 """please config ROOT_dir and user when u first using"""
 C.repo_name = 'FasterSeg'
 C.abs_dir = osp.realpath(".")
+# print('C.abs_dir', C.abs_dir)
 C.this_dir = C.abs_dir.split(osp.sep)[-1]
-C.root_dir = C.abs_dir[:C.abs_dir.index(C.repo_name) + len(C.repo_name)]
+# print('C.this_dir', C.this_dir)
+C.root_dir = '../'
 C.log_dir = osp.abspath(osp.join(C.root_dir, 'log', C.this_dir))
 
 """Data Dir"""
@@ -74,7 +76,7 @@ C.eval_width = 2048 # real image width
 
 C.layers = 16 # layers (cells) for network
 """ Train Config """
-C.mode = "student" # "teacher" or "student"
+C.mode = "teacher" # "teacher" or "student"
 if C.mode == "teacher":
     ##### train teacher model only ####################################
     C.arch_idx = [0] # 0 for teacher
@@ -105,5 +107,5 @@ elif C.mode == "student":
 
 ########################################
 C.is_test = False # if True, prediction files for the test set will be generated
-C.is_eval = False # if True, the train.py will only do evaluation for once
+C.is_eval = True # if True, the train.py will only do evaluation for once
 C.eval_path = "fasterseg" # path to pretrained directory to be evaluated
